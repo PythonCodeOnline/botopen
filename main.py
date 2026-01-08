@@ -63,8 +63,11 @@ def is_joined(status: str) -> bool:
 
 async def check_membership(bot, user_id: int) -> bool:
     """调用 getChatMember 检查用户是否在 REQUIRED_CHAT。"""
-    member = await bot.get_chat_member(chat_id=REQUIRED_CHAT, user_id=user_id)
-    return is_joined(member.status)
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHAT, user_id=user_id)
+        return is_joined(member.status)
+    except TelegramError:
+        raise
 
 
 async def send_join_prompt(chat_id: int, bot, extra_text: str = ""):
@@ -85,26 +88,21 @@ async def send_join_prompt(chat_id: int, bot, extra_text: str = ""):
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
-# ===================== 你的原业务逻辑入口（示例占位） =====================
-async def business_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===================== 全局拦截器 =====================
+async def global_gate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    这里写你原来的 /start 业务逻辑（验证通过后才会调用）
+    全局拦截器：拦截所有消息和命令，先验证入群
+    如果验证失败，直接返回，阻止后续 handlers 执行
     """
-    await update.message.reply_text("✅ 校验通过：进入你的业务逻辑（示例占位）")
-# =====================================================================
-
-
-async def start_with_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /start：先校验入群，再进入业务逻辑
-    """
+    if not update.effective_user:
+        return
+    
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
 
     try:
         ok = await check_membership(context.bot, uid)
     except TelegramError as e:
-        # 不用 Markdown，避免 "Can't parse entities" 类错误
         extra = (
             "⚠️ 无法校验入群状态（可能 REQUIRED_CHAT 配置错误，或 bot 未加入/无权限）。\n"
             f"REQUIRED_CHAT={REQUIRED_CHAT_RAW}\n"
@@ -117,12 +115,28 @@ async def start_with_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_join_prompt(chat_id, context.bot)
         return
 
-    await business_start(update, context)
+    # ✅ 验证通过，什么都不做，让后续 handlers 继续处理
 
 
+# ===================== 业务逻辑 handlers =====================
+async def business_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /start 命令的业务逻辑（只有通过全局拦截器验证后才会执行）
+    """
+    await update.message.reply_text("✅ 校验通过")
+
+
+async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    处理所有文本消息（只有通过全局拦截器验证后才会执行）
+    """
+    await update.message.reply_text(f"（示例）收到：{update.message.text}")
+
+
+# ===================== 复查按钮回调 =====================
 async def on_recheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    复查按钮：复查通过后提示用户再发 /start（避免改变你业务流程）
+    复查按钮：复查通过后提示用户再发 /start
     """
     q = update.callback_query
     await q.answer()
@@ -147,13 +161,8 @@ async def on_recheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text="🎉 已确认你已加入！请发送 /start 继续。")
 
 
-# 其它消息（示例）：这里不做门禁，你可以换成自己的业务 handler
-async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-    #await update.message.reply_text(f"（示例）收到：{update.message.text}")
-
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """全局错误处理"""
     logger.exception("Unhandled exception: %s", context.error)
 
 
@@ -170,13 +179,23 @@ def run_flask():
     port = int(os.getenv('PORT', '5000'))
     flask_app.run(host='0.0.0.0', port=port, debug=False)
 
+
 # ===================== 主程序 =====================
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_with_gate))
-    app.add_handler(CallbackQueryHandler(on_recheck, pattern=f"^{BTN_RECHECK}$"))
+    # ⚠️ 关键：handler 添加顺序很重要！
+    # 1️⃣ 最高优先级（group=-1）：全局拦截器，拦截所有消息和命令
+    app.add_handler(MessageHandler(filters.ALL, global_gate_handler), group=-1)
+    
+    # 2️⃣ 默认优先级（group=0）：具体业务 handlers（只有通过拦截器才会执行）
+    app.add_handler(CommandHandler("start", business_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_any_text))
+    
+    # 3️⃣ 回调查询 handler（不受全局拦截器影响，因为它处理按钮点击）
+    app.add_handler(CallbackQueryHandler(on_recheck, pattern=f"^{BTN_RECHECK}$"))
+    
+    # 4️⃣ 错误处理
     app.add_error_handler(error_handler)
 
     logger.info("Bot started. REQUIRED_CHAT=%s", REQUIRED_CHAT_RAW)
